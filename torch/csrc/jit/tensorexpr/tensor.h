@@ -2,6 +2,7 @@
 
 #include <torch/csrc/Export.h>
 #include <functional>
+#include <utility>
 #include <vector>
 
 #include <torch/csrc/jit/tensorexpr/expr.h>
@@ -15,7 +16,7 @@ class TORCH_API Tensor {
  public:
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   Tensor(BufPtr buf, const std::vector<VarPtr>& args, ExprPtr body)
-      : buf_(buf) {
+      : buf_(std::move(buf)) {
     stmt_ = constructStmt(args, body, {}, {});
   }
   Tensor(BufHandle buf, const std::vector<VarHandle>& args, ExprHandle body)
@@ -28,7 +29,7 @@ class TORCH_API Tensor {
       const std::vector<ExprPtr>& reduce_dims,
       const std::vector<VarPtr>& reduce_args,
       ExprPtr body)
-      : buf_(buf) {
+      : buf_(std::move(buf)) {
     stmt_ = constructStmt(args, body, reduce_dims, reduce_args);
   }
   Tensor(
@@ -44,7 +45,8 @@ class TORCH_API Tensor {
             VarHandleVectorToVarVector(reduce_args),
             body.node()) {}
 
-  Tensor(BufPtr buf, StmtPtr stmt) : buf_(buf), stmt_(stmt) {}
+  Tensor(BufPtr buf, StmtPtr stmt)
+      : buf_(std::move(buf)), stmt_(std::move(stmt)) {}
 
   BufPtr buf() const {
     return buf_;
@@ -135,8 +137,8 @@ inline std::vector<VarHandle> create_index_vars(
   std::vector<VarHandle> vars;
   vars.reserve(dims.size());
   for (const ExprHandle& dim : dims) {
-    vars.push_back(VarHandle(alloc<Var>(
-        "i", dim.dtype().scalar_type() == ScalarType::Long ? kLong : kInt)));
+    vars.emplace_back(alloc<Var>(
+        "i", dim.dtype().scalar_type() == ScalarType::Long ? kLong : kInt));
   }
   return vars;
 }
@@ -171,7 +173,16 @@ Tensor Reduce(
   std::vector<ExprHandle> output_args(vars.begin(), vars.end());
   ExprHandle init_expr = Cast::make(body.dtype(), init_func(vars));
   BufHandle func_result = Buf::make(func_name, dims, body.dtype(), init_expr);
+
   ExprHandle reduce_op = reducer(func_result, body, output_args, reduce_vars);
+  if (body.dtype() == kBFloat16) {
+    ExprHandle init_expr_acc = Cast::make(kFloat, init_func(vars));
+    BufHandle func_result_acc =
+        Buf::make(func_name + "_acc", dims, kFloat, init_expr_acc);
+    reduce_op =
+        reducer(func_result, func_result_acc, body, output_args, reduce_vars);
+  }
+
   Tensor t = Tensor(func_result, vars, reduce_dims, reduce_vars, reduce_op);
   return t;
 }

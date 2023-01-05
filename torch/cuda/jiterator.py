@@ -6,6 +6,7 @@ import re
 
 __all__ : List[str] = []
 
+
 class _CodeParser:
     def __init__(self, code_string: str):
         optional_ws = r"\s*"
@@ -37,6 +38,7 @@ class _CodeParser:
         self.function_params = result["function_params"]
         self.function_body = result["function_body"]
 
+
 class _JittedFunction:
     def __init__(self, code_string: str, return_by_ref: bool, num_outputs: int, **kwargs):
         self.code_string = code_string
@@ -54,7 +56,7 @@ class _JittedFunction:
     def __call__(self, *tensors: Tensor, **kwargs):
         # Jiterator follow torch.cuda's lazy initialization behavior
         # Defer checking cuda's availability at the function invocation time
-        assert self.is_cuda_available, "Jiterator is only supported on CUDA GPUs, no CUDA GPUs are available."
+        assert self.is_cuda_available, "Jiterator is only supported on CUDA and ROCm GPUs, none are available."
 
         assert len(tensors) <= 8, "jiterator only supports up to 8 tensor inputs."
 
@@ -98,7 +100,7 @@ def _create_jit_fn(code_string: str, **kwargs) -> Callable:
         # invoke jitted function like a regular python function
         result = jitted_fn(a, b, alpha=3.14)
 
-    code_string also allows mulitple function definitions, and the last function will be treated as the entry function.
+    code_string also allows multiple function definitions, and the last function will be treated as the entry function.
 
     Example::
 
@@ -134,6 +136,7 @@ def _create_jit_fn(code_string: str, **kwargs) -> Callable:
     """
 
     return _JittedFunction(code_string, return_by_ref=False, num_outputs=1, **kwargs)
+
 
 def _create_multi_output_jit_fn(code_string: str, num_outputs: int, **kwargs) -> Callable:
     """

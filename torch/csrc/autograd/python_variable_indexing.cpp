@@ -16,12 +16,14 @@
 
 #include <ATen/DeviceGuard.h>
 #include <ATen/ExpandUtils.h>
+#include <ATen/Functions.h>
 #include <ATen/TensorIndexing.h>
 #include <ATen/TracerMode.h>
 #include <ATen/core/LegacyTypeDispatch.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/irange.h>
 
+#include <c10/core/Layout.h>
 #include <tuple>
 #include <vector>
 
@@ -46,7 +48,9 @@ Py_ssize_t THPVariable_length(PyObject* self) {
   if (self_.dim() == 0) {
     return 0;
   }
-  return (Py_ssize_t)self_.size(0);
+  // TODO: Maybe this should return a SymInt directly?
+  // Add the guard to get a nice error message if/when we will hit this.
+  return (Py_ssize_t)self_.sym_size(0).guard_int(__FILE__, __LINE__);
   END_HANDLE_TH_ERRORS_RET(-1)
 }
 
@@ -82,13 +86,6 @@ static inline int64_t count_specified_dimensions(PyObject* index) {
   return count;
 }
 
-[[noreturn]] static inline void invalid_index(PyObject* obj) {
-  throw IndexError(
-      "only integers, slices (`:`), ellipsis (`...`), None and long or byte "
-      "Variables are valid indices (got %s)",
-      Py_TYPE(obj)->tp_name);
-}
-
 static inline Variable sequenceToVariable(
     c10::TensorOptions options,
     PyObject* seq) {
@@ -113,10 +110,12 @@ inline Variable valueToTensor(
   } else if (PyComplex_Check(value)) {
     scalar = Scalar(THPUtils_unpackComplexDouble(value));
   } else {
-    throw TypeError(
-        "can't assign a %s to a %s",
+    TORCH_CHECK_TYPE(
+        false,
+        "can't assign a ",
         Py_TYPE(value)->tp_name,
-        torch::utils::options_to_string(options).c_str());
+        " to a ",
+        torch::utils::options_to_string(options));
   }
   // lift_fresh is supposed to be used in situations where you are guaranteed to
   // get a plain Tensor which is not true for cpu device but not for non cpu
@@ -134,7 +133,7 @@ static inline void checkUnpackSlice(
     Py_ssize_t* start_ptr,
     Py_ssize_t* stop_ptr,
     Py_ssize_t* step_ptr) {
-  if (!THPUtils_unpackSlice(index, start_ptr, stop_ptr, step_ptr)) {
+  if (PySlice_Unpack(index, start_ptr, stop_ptr, step_ptr) != 0) {
     throw python_error();
   }
 }
@@ -175,18 +174,18 @@ static inline Variable applySlicing(
     variable_list& outIndices,
     bool is_tracing,
     const at::Device& self_device,
-    const c10::optional<IntArrayRef>& self_sizes,
+    const c10::optional<int64_t>& self_ndim,
     int64_t specified_dims) {
   int64_t size =
       PyTuple_GET_SIZE(index); // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
   int64_t dim = 0;
 
   // See NOTE [nested tensor size for indexing]
-  if (self_sizes.has_value()) {
+  if (self_ndim.has_value()) {
     TORCH_CHECK_INDEX(
-        specified_dims <= (int64_t)self_sizes->size(),
+        specified_dims <= self_ndim.value(),
         "too many indices for tensor of dimension ",
-        (int)self_sizes->size());
+        self_ndim.value());
   }
 
   Variable result = self;
@@ -197,9 +196,9 @@ static inline Variable applySlicing(
     // nested tensor does not have a size (yet) so for now we represent its size
     // as null may need to be changed after we reach a better solution for
     // nested tensor size
-    c10::optional<IntArrayRef> result_sizes = result.is_nested()
-        ? c10::optional<IntArrayRef>(c10::nullopt)
-        : c10::optional<IntArrayRef>(result.sizes());
+    c10::optional<SymIntArrayRef> result_sizes = result.is_nested()
+        ? c10::optional<SymIntArrayRef>(c10::nullopt)
+        : c10::optional<SymIntArrayRef>(result.sym_sizes());
     result = at::indexing::handleDimInMultiDimIndexing(
         /*prev_dim_result=*/result,
         /*original_tensor=*/self,
@@ -242,7 +241,12 @@ static inline Variable applySlicing(
             auto idx = THPObjectPtr(PyNumber_Index(obj));
             if (!idx) {
               PyErr_Clear();
-              invalid_index(obj);
+              TORCH_CHECK_INDEX(
+                  false,
+                  "only integers, slices (`:`), ellipsis (`...`), None and long or byte "
+                  "Variables are valid indices (got ",
+                  Py_TYPE(obj)->tp_name,
+                  ")");
             }
             if (is_tracing && THPVariable_Check(idx)) {
               recordSelectTrace(THPVariable_Unpack(idx));
@@ -381,17 +385,13 @@ PyObject* THPVariable_getitem(PyObject* self, PyObject* index) {
   if (specified_dims == -1) {
     return handle_torch_function_indexing(self, holder.get());
   }
-  // See NOTE [nested tensor size for indexing]
-  c10::optional<IntArrayRef> self_sizes = c10::nullopt;
-  if (!self_.is_nested())
-    self_sizes = self_.sizes();
   Variable sliced = applySlicing(
       self_,
       holder.get(),
       variableIndices,
       /*is_tracing=*/is_tracing,
       self_.device(),
-      self_sizes,
+      self_.ndimension(),
       specified_dims);
   if (variableIndices.empty()) {
     if (sliced.is_same(self_)) {
@@ -430,9 +430,8 @@ void dispatch_set_item(
 // indexing is needed, it calls C++ `at::indexing::dispatch_index_put_`.
 int THPVariable_setitem(PyObject* self, PyObject* index, PyObject* py_value) {
   HANDLE_TH_ERRORS
-  if (py_value == nullptr) {
-    throw TypeError("Tensor does not support deleting items");
-  }
+  TORCH_CHECK_TYPE(
+      py_value != nullptr, "Tensor does not support deleting items");
   if ((!THPVariable_CheckExact(self) && check_has_torch_function(self)) ||
       (!THPVariable_CheckExact(py_value) &&
        check_has_torch_function(py_value))) {
@@ -442,9 +441,11 @@ int THPVariable_setitem(PyObject* self, PyObject* index, PyObject* py_value) {
   }
 
   const auto& self_ = THPVariable_Unpack(self);
-  if (self_.is_sparse() || self_.is_sparse_csr()) {
-    throw TypeError("Cannot assign to a sparse tensor");
-  }
+  TORCH_CHECK_TYPE(
+      self_.layout() != kSparse && self_.layout() != kSparseCsr &&
+          self_.layout() != kSparseCsc && self_.layout() != kSparseBsr &&
+          self_.layout() != kSparseBsc,
+      "Cannot assign to a sparse tensor");
   OptionalDeviceGuard device_guard(device_of(self_));
   at::Device self_device = self_.device();
   Variable value;
@@ -519,7 +520,7 @@ int THPVariable_setitem(PyObject* self, PyObject* index, PyObject* py_value) {
       variableIndices,
       /*is_tracing=*/is_tracing,
       self_device,
-      self_.sizes(),
+      self_.ndimension(),
       specified_dims);
   if (variableIndices.empty()) {
     pybind11::gil_scoped_release no_gil;
@@ -529,11 +530,12 @@ int THPVariable_setitem(PyObject* self, PyObject* index, PyObject* py_value) {
 
   {
     pybind11::gil_scoped_release no_gil;
-    IntArrayRef valueSizes = value.sizes();
-    IntArrayRef slicedValueSizes = at::indexing::slicePrefix1sSize(valueSizes);
+    SymIntArrayRef valueSizes = value.sym_sizes();
+    SymIntArrayRef slicedValueSizes =
+        at::indexing::slicePrefix1sSize(valueSizes);
     torch::autograd::Variable valuesSliced;
     if (!valueSizes.equals(slicedValueSizes)) {
-      valuesSliced = value.view(slicedValueSizes);
+      valuesSliced = value.view_symint(slicedValueSizes);
     } else {
       valuesSliced = value;
     }

@@ -99,6 +99,8 @@ static PyObject* THPStorage_pynew(
     } else if (device.type() == at::kMPS) {
       allocator = at::mps::GetMPSAllocator();
 #endif
+    } else if (device.type() == at::DeviceType::XPU) {
+      allocator = c10::GetAllocator(device.type());
     } else if (device.type() == at::DeviceType::Meta) {
       allocator = c10::GetAllocator(device.type());
     } else {
@@ -215,7 +217,8 @@ static PyObject* THPStorage_get(THPStorage* self, PyObject* index) {
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     Py_ssize_t start, stop, slicelength, step;
     int64_t len = self->cdata->nbytes() / sizeof(uint8_t);
-    if (!THPUtils_parseSlice(index, len, &start, &stop, &step, &slicelength))
+    if (PySlice_GetIndicesEx(index, len, &start, &stop, &step, &slicelength) !=
+        0)
       return nullptr;
     if (step != 1) {
       THPUtils_setError(
@@ -277,7 +280,8 @@ static int THPStorage_set(THPStorage* self, PyObject* index, PyObject* value) {
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     Py_ssize_t start, stop, slicelength, step;
     int64_t len = self->cdata->nbytes() / sizeof(uint8_t);
-    if (!THPUtils_parseSlice(index, len, &start, &stop, &step, &slicelength))
+    if (PySlice_GetIndicesEx(index, len, &start, &stop, &step, &slicelength) !=
+        0)
       return -1;
     if (step != 1) {
       THPUtils_setError(

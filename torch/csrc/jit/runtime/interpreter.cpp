@@ -297,7 +297,7 @@ struct InterpreterStateImpl : c10::intrusive_ptr_target {
             INST_NEXT;
           case INST(OPN): {
             INST_GUARD;
-            stack.push_back(inst.N);
+            stack.emplace_back(inst.N);
 #ifndef NDEBUG
             size_t init_size = stack.size();
 #endif
@@ -751,7 +751,8 @@ struct InterpreterStateImpl : c10::intrusive_ptr_target {
                 // Sends the warning to the warning handler with the
                 // "verbatim" flag. This flag ensures the warning handler
                 // will print the exception as configured.
-                c10::Warning::warn(location, msg, /*verbatim=*/true);
+                c10::warn(c10::Warning(
+                    c10::UserWarning(), location, msg, /*verbatim=*/true));
               }
               stack.pop_back();
             } else {

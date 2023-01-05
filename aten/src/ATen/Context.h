@@ -8,6 +8,7 @@
 #include <ATen/core/LegacyTypeDispatch.h>
 #include <ATen/detail/CUDAHooksInterface.h>
 #include <ATen/detail/HIPHooksInterface.h>
+#include <ATen/detail/MPSHooksInterface.h>
 #include <ATen/detail/ORTHooksInterface.h>
 #include <c10/core/QEngine.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
@@ -37,6 +38,8 @@ class TORCH_API Context {
       return at::detail::getDefaultCPUGenerator();
     } else if (device_type == at::kCUDA) {
       return at::detail::getCUDAHooks().getDefaultCUDAGenerator(device.index());
+    } else if (device_type == at::kMPS) {
+      return at::detail::getMPSHooks().getDefaultMPSGenerator();
     } else {
       AT_ERROR(DeviceTypeName(device_type), " device type not enabled.");
     }
@@ -83,6 +86,9 @@ class TORCH_API Context {
   static bool hasHIP() {
     return detail::getHIPHooks().hasHIP();
   }
+  static bool hasMPS() {
+    return detail::getMPSHooks().hasMPS();
+  }
   static bool hasIPU() {
     return c10::impl::hasDeviceGuardImpl(at::DeviceType::IPU);
   }
@@ -92,8 +98,6 @@ class TORCH_API Context {
   static bool hasLazy() {
     return c10::impl::hasDeviceGuardImpl(at::DeviceType::Lazy);
   }
-  static bool hasMPS();
-
   static bool hasORT() {
     return c10::impl::hasDeviceGuardImpl(at::DeviceType::ORT);
   }
@@ -125,6 +129,26 @@ class TORCH_API Context {
   void setBenchmarkLimitCuDNN(int);
   bool deterministicCuDNN() const;
   void setDeterministicCuDNN(bool);
+
+  // Note [Disabling Fused SDP Kernels]
+  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  // Flash and Memory Efficient SDP kernels are enabled by default.
+  // However, they can be disabled by setting
+  // at::globalContext().setUserEnabledFlashSDP(false) flag.
+  // This is useful for debugging purposes. For example, if you want to
+  // compare the performance of the flash SDP kernels with the unfused
+  // kernel, you can disable the flash SDP kernels. By disabling
+  // the math SDP kernel, you can force your code to use flash kernels.
+  // The math SDP kernel can be disabled by setting
+  // at::globalContext().setUserEnabledMathSDP(false) flag.
+  void setSDPUseFlash(bool);
+  bool userEnabledFlashSDP() const;
+
+  void setSDPUseMemEfficient(bool);
+  bool userEnabledMemEfficientSDP() const;
+
+  void setSDPUseMath(bool);
+  bool userEnabledMathSDP() const;
 
   at::LinalgBackend linalgPreferredBackend() const;
   void setLinalgPreferredBackend(at::LinalgBackend);
@@ -219,6 +243,8 @@ class TORCH_API Context {
   void setFloat32MatmulPrecision(Float32MatmulPrecision p);
   bool allowFP16ReductionCuBLAS() const;
   void setAllowFP16ReductionCuBLAS(bool);
+  bool allowBF16ReductionCuBLAS() const;
+  void setAllowBF16ReductionCuBLAS(bool);
   at::QEngine qEngine() const;
   void setQEngine(at::QEngine e);
   static const std::vector<at::QEngine>& supportedQEngines();
@@ -253,12 +279,20 @@ class TORCH_API Context {
   bool deterministic_cudnn = false;
   bool _deterministic_algorithms = false;
   bool _deterministic_algorithms_warn_only = false;
+  bool enabled_flashSDP = true;
+  bool enabled_mem_efficientSDP = true;
+  bool enabled_mathSDP = true;
+#ifdef USE_ROCM
+  bool benchmark_cudnn = true;
+#else
   bool benchmark_cudnn = false;
+#endif
   Float32MatmulPrecision float32_matmul_precision =
       at::Float32MatmulPrecision::HIGHEST;
   int benchmark_limit_cudnn = 10;
   bool allow_tf32_cudnn = true;
   bool allow_fp16_reduction_cublas = true;
+  bool allow_bf16_reduction_cublas = true;
   bool enabled_mkldnn = true;
   at::LinalgBackend linalg_preferred_backend = at::LinalgBackend::Default;
 #ifdef C10_MOBILE
@@ -391,6 +425,13 @@ static inline void manual_seed(uint64_t seed) {
         cuda_gen.set_current_seed(seed);
       }
     }
+  }
+
+  if (hasMPS()) {
+    auto mps_gen = globalContext().defaultGenerator(DeviceType::MPS);
+    // See Note [Acquire lock when using random generators]
+    std::lock_guard<std::mutex> lock(mps_gen.mutex());
+    mps_gen.set_current_seed(seed);
   }
 }
 
